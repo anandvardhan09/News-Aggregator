@@ -1,4 +1,4 @@
-# app.py - Main Flask application
+# app.py - Main Flask application with MongoDB
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import feedparser
@@ -11,6 +11,8 @@ from typing import List, Dict
 import re
 import hashlib
 import json
+from pymongo import MongoClient
+from bson import ObjectId
 
 load_dotenv()
 
@@ -21,29 +23,76 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration - Using Hugging Face free API
-HF_API_KEY = os.getenv('HF_API_KEY', '')  # Optional, works without API key
+# Configuration
+HF_API_KEY = os.getenv('HF_API_KEY', '')
 HF_API_URL = "https://api-inference.huggingface.co/models/facebook/bart-large-cnn"
+MONGODB_URI = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/ai_news')
+
+# Initialize MongoDB
+try:
+    client = MongoClient(MONGODB_URI)
+    db = client.get_default_database() if MONGODB_URI != 'mongodb://localhost:27017/ai_news' else client.ai_news
+    articles_collection = db.articles
+    sources_collection = db.sources
+    logger.info("MongoDB connected successfully")
+except Exception as e:
+    logger.error(f"MongoDB connection failed: {str(e)}")
+    client = None
+    db = None
 
 # News sources (RSS feeds)
 NEWS_SOURCES = [
-    {'name': 'TechCrunch AI', 'url': 'https://techcrunch.com/category/artificial-intelligence/feed/'},
-    {'name': 'VentureBeat AI', 'url': 'https://venturebeat.com/ai/feed/'},
-    {'name': 'MIT Technology Review', 'url': 'https://www.technologyreview.com/feed/'},
-    {'name': 'The Verge AI', 'url': 'https://www.theverge.com/ai-artificial-intelligence/rss/index.xml'},
-    {'name': 'AI News', 'url': 'https://artificialintelligence-news.com/feed/'},
+    {'name': 'TechCrunch AI', 'url': 'https://techcrunch.com/category/artificial-intelligence/feed/', 'active': True},
+    {'name': 'VentureBeat AI', 'url': 'https://venturebeat.com/ai/feed/', 'active': True},
+    {'name': 'MIT Technology Review', 'url': 'https://www.technologyreview.com/feed/', 'active': True},
+    {'name': 'The Verge AI', 'url': 'https://www.theverge.com/ai-artificial-intelligence/rss/index.xml', 'active': True},
+    {'name': 'AI News', 'url': 'https://artificialintelligence-news.com/feed/', 'active': True},
 ]
 
 class NewsAggregator:
     def __init__(self):
         self.articles = []
+        self.initialize_sources()
+    
+    def initialize_sources(self):
+        """Initialize sources in MongoDB"""
+        if db is not None:
+            try:
+                for source in NEWS_SOURCES:
+                    sources_collection.update_one(
+                        {'name': source['name']},
+                        {'$set': source},
+                        upsert=True
+                    )
+            except Exception as e:
+                logger.error(f"Error initializing sources: {str(e)}")
     
     def fetch_articles(self, hours_back: int = 24) -> List[Dict]:
         """Fetch articles from all news sources"""
-        all_articles = []
         cutoff_time = datetime.now() - timedelta(hours=hours_back)
         
-        for source in NEWS_SOURCES:
+        # Try to get cached articles from MongoDB first
+        if db is not None:
+            try:
+                cached_articles = list(articles_collection.find({
+                    'published': {'$gte': cutoff_time.isoformat()},
+                    'created_at': {'$gte': cutoff_time}
+                }).sort('published', -1))
+                
+                if cached_articles:
+                    # Convert ObjectId to string for JSON serialization
+                    for article in cached_articles:
+                        article['_id'] = str(article['_id'])
+                    logger.info(f"Returning {len(cached_articles)} cached articles")
+                    return cached_articles
+            except Exception as e:
+                logger.error(f"Error fetching cached articles: {str(e)}")
+        
+        # Fetch fresh articles if no cache or cache is old
+        all_articles = []
+        active_sources = self.get_active_sources()
+        
+        for source in active_sources:
             try:
                 logger.info(f"Fetching from {source['name']}")
                 feed = feedparser.parse(source['url'])
@@ -57,7 +106,8 @@ class NewsAggregator:
                     # Only include recent articles
                     if published > cutoff_time:
                         # Create unique ID for deduplication
-                        article_id = hashlib.md5(entry.title.encode()).hexdigest()
+                        content = self.clean_html(getattr(entry, 'summary', ''))
+                        article_id = hashlib.md5((entry.title + source['name']).encode()).hexdigest()
                         
                         article = {
                             'id': article_id,
@@ -66,9 +116,11 @@ class NewsAggregator:
                             'link': entry.link,
                             'published': published.isoformat(),
                             'source': source['name'],
-                            'content': self.clean_html(getattr(entry, 'summary', '')),
+                            'content': content,
                             'ai_summary': '',
-                            'sentiment': 'neutral'
+                            'sentiment': 'neutral',
+                            'created_at': datetime.now(),
+                            'updated_at': datetime.now()
                         }
                         
                         # Generate AI summary and sentiment
@@ -81,9 +133,37 @@ class NewsAggregator:
             except Exception as e:
                 logger.error(f"Error fetching from {source['name']}: {str(e)}")
         
-        # Remove duplicates based on title similarity
+        # Remove duplicates and save to MongoDB
         unique_articles = self.remove_duplicates(all_articles)
+        self.save_articles_to_db(unique_articles)
+        
         return sorted(unique_articles, key=lambda x: x['published'], reverse=True)
+    
+    def get_active_sources(self) -> List[Dict]:
+        """Get active sources from MongoDB or fallback to default"""
+        if db is not None:
+            try:
+                sources = list(sources_collection.find({'active': True}))
+                if sources:
+                    return sources
+            except Exception as e:
+                logger.error(f"Error fetching sources from DB: {str(e)}")
+        
+        return NEWS_SOURCES
+    
+    def save_articles_to_db(self, articles: List[Dict]):
+        """Save articles to MongoDB"""
+        if db is not None and articles:
+            try:
+                for article in articles:
+                    articles_collection.update_one(
+                        {'id': article['id']},
+                        {'$set': article},
+                        upsert=True
+                    )
+                logger.info(f"Saved {len(articles)} articles to database")
+            except Exception as e:
+                logger.error(f"Error saving articles to DB: {str(e)}")
     
     def clean_html(self, text: str) -> str:
         """Remove HTML tags from text"""
@@ -96,16 +176,15 @@ class NewsAggregator:
         unique_articles = []
         
         for article in articles:
-            title_hash = hashlib.md5(article['title'].lower().encode()).hexdigest()
-            if title_hash not in seen_titles:
-                seen_titles.add(title_hash)
+            title_key = article['title'].lower().strip()
+            if title_key not in seen_titles:
+                seen_titles.add(title_key)
                 unique_articles.append(article)
         
         return unique_articles
     
     def summarize_article(self, content: str) -> str:
         """Generate AI summary using Hugging Face API"""
-        # Clean and truncate content for API limits
         clean_content = self.clean_html(content)
         if len(clean_content) > 1000:
             clean_content = clean_content[:1000]
@@ -118,7 +197,6 @@ class NewsAggregator:
             if HF_API_KEY:
                 headers["Authorization"] = f"Bearer {HF_API_KEY}"
             
-            # Use Hugging Face BART model for summarization
             response = requests.post(
                 HF_API_URL,
                 headers=headers,
@@ -140,11 +218,10 @@ class NewsAggregator:
                 elif isinstance(result, dict) and 'summary_text' in result:
                     return result['summary_text']
             
-            # Fallback to simple truncation
             return clean_content[:200] + "..." if len(clean_content) > 200 else clean_content
             
         except Exception as e:
-            logger.error(f"Error generating summary with Hugging Face: {str(e)}")
+            logger.error(f"Error generating summary: {str(e)}")
             return clean_content[:200] + "..." if len(clean_content) > 200 else clean_content
     
     def get_sentiment(self, text: str) -> str:
@@ -157,7 +234,7 @@ class NewsAggregator:
             response = requests.post(
                 "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest",
                 headers=headers,
-                json={"inputs": text[:500]},  # Limit text length
+                json={"inputs": text[:500]},
                 timeout=10
             )
             
@@ -166,7 +243,14 @@ class NewsAggregator:
                 if isinstance(result, list) and len(result) > 0:
                     sentiment_data = result[0]
                     if isinstance(sentiment_data, list) and len(sentiment_data) > 0:
-                        return sentiment_data[0].get('label', 'neutral').lower()
+                        label = sentiment_data[0].get('label', 'neutral').lower()
+                        # Map sentiment labels
+                        if 'pos' in label:
+                            return 'positive'
+                        elif 'neg' in label:
+                            return 'negative'
+                        else:
+                            return 'neutral'
             
             return 'neutral'
         except Exception as e:
@@ -178,63 +262,39 @@ aggregator = NewsAggregator()
 
 @app.route('/')
 def health_check():
-    return jsonify({'status': 'healthy', 'message': 'AI News Aggregator API is running'})
+    return jsonify({
+        'status': 'healthy', 
+        'message': 'AI News Aggregator API is running',
+        'mongodb_connected': db is not None,
+        'timestamp': datetime.now().isoformat()
+    })
 
 @app.route('/api/news', methods=['GET'])
 def get_news():
     """Get aggregated news articles"""
     try:
         hours_back = request.args.get('hours', 24, type=int)
+        force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+        
+        if force_refresh and db is not None:
+            # Clear cache for forced refresh
+            try:
+                cutoff_time = datetime.now() - timedelta(hours=hours_back)
+                articles_collection.delete_many({'created_at': {'$gte': cutoff_time}})
+            except Exception as e:
+                logger.error(f"Error clearing cache: {str(e)}")
+        
         articles = aggregator.fetch_articles(hours_back)
         
         return jsonify({
             'success': True,
             'articles': articles,
             'count': len(articles),
-            'last_updated': datetime.now().isoformat()
+            'last_updated': datetime.now().isoformat(),
+            'cached': not force_refresh
         })
     except Exception as e:
         logger.error(f"Error fetching news: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/summarize', methods=['POST'])
-def summarize_article():
-    """Summarize a specific article"""
-    try:
-        data = request.get_json()
-        content = data.get('content', '')
-        
-        if not content:
-            return jsonify({'success': False, 'error': 'Content is required'}), 400
-        
-        summary = aggregator.summarize_article(content)
-        
-        return jsonify({
-            'success': True,
-            'summary': summary
-        })
-    except Exception as e:
-        logger.error(f"Error summarizing article: {str(e)}")
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/sentiment', methods=['POST'])
-def analyze_sentiment():
-    """Analyze sentiment of text"""
-    try:
-        data = request.get_json()
-        text = data.get('text', '')
-        
-        if not text:
-            return jsonify({'success': False, 'error': 'Text is required'}), 400
-        
-        sentiment = aggregator.get_sentiment(text)
-        
-        return jsonify({
-            'success': True,
-            'sentiment': sentiment
-        })
-    except Exception as e:
-        logger.error(f"Error analyzing sentiment: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/categories', methods=['GET'])
@@ -243,7 +303,6 @@ def get_categories():
     try:
         articles = aggregator.fetch_articles(24)
         
-        # Simple keyword-based categorization
         categories = {
             'Machine Learning': 0,
             'Natural Language Processing': 0,
@@ -289,10 +348,55 @@ def get_categories():
 @app.route('/api/sources', methods=['GET'])
 def get_sources():
     """Get available news sources"""
-    return jsonify({
-        'success': True,
-        'sources': NEWS_SOURCES
-    })
+    try:
+        sources = aggregator.get_active_sources()
+        return jsonify({
+            'success': True,
+            'sources': sources
+        })
+    except Exception as e:
+        logger.error(f"Error getting sources: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/summarize', methods=['POST'])
+def summarize_article():
+    """Summarize a specific article"""
+    try:
+        data = request.get_json()
+        content = data.get('content', '')
+        
+        if not content:
+            return jsonify({'success': False, 'error': 'Content is required'}), 400
+        
+        summary = aggregator.summarize_article(content)
+        
+        return jsonify({
+            'success': True,
+            'summary': summary
+        })
+    except Exception as e:
+        logger.error(f"Error summarizing article: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/sentiment', methods=['POST'])
+def analyze_sentiment():
+    """Analyze sentiment of text"""
+    try:
+        data = request.get_json()
+        text = data.get('text', '')
+        
+        if not text:
+            return jsonify({'success': False, 'error': 'Text is required'}), 400
+        
+        sentiment = aggregator.get_sentiment(text)
+        
+        return jsonify({
+            'success': True,
+            'sentiment': sentiment
+        })
+    except Exception as e:
+        logger.error(f"Error analyzing sentiment: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
