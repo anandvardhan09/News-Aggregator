@@ -22,6 +22,6 @@
     }
   ],
   "env": {
-    "REACT_APP_API_URL": "https://your-render-backend-url.onrender.com"
+    "REACT_APP_API_URL": "https://news-aggregator-backend-qv19.onrender.com"
   }
 }
